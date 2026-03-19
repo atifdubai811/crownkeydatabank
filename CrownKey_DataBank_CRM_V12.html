@@ -288,7 +288,7 @@ body.light-theme .modal,body.light-theme .login-box{background:var(--dark2);}
 .seg-card:hover{border-color:var(--border);}
 .seg-count-bubble{font-family:'Cormorant Garamond',serif;font-size:32px;color:var(--gold);font-weight:500;}
 .crm-panel{background:var(--dark3);border:1px solid var(--border2);border-radius:12px;padding:20px 22px;margin-bottom:16px;}
-/* ═══════════ CRM V10 ADDON STYLES ═══════════ */
+/* ═══════════ CRM V12 ADDON STYLES ═══════════ */
 .crm-stat{background:var(--dark3);border:1px solid var(--border2);border-radius:10px;padding:14px 18px;text-align:center;transition:border-color .2s;}
 .crm-stat:hover{border-color:var(--border);}
 .crm-stat .cv{font-family:'Cormorant Garamond',serif;font-size:28px;font-weight:500;}
@@ -314,7 +314,7 @@ body.light-theme .modal,body.light-theme .login-box{background:var(--dark2);}
 </div>
 <div id="login-screen">
   <div class="login-logo">CROWN KEY</div>
-  <div class="login-sub">DataBank CRM V10 — Secure Access</div>
+  <div class="login-sub">DataBank CRM V12 — Secure Access</div>
   <div class="login-box">
     <div id="login-step1">
       <h3>Welcome Back</h3>
@@ -433,13 +433,14 @@ body.light-theme .modal,body.light-theme .login-box{background:var(--dark2);}
 <input type="file" id="folder-input" accept=".xlsx,.xls" multiple webkitdirectory style="display:none" onchange="handleFileUpload(this.files)">
 <script>
 'use strict';
-const SUPABASE_URL  = 'https://fweagpbffngfrpuvxbda.supabase.co';
-const SUPABASE_KEY  = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImZ3ZWFncGJmZm5nZnJwdXZ4YmRhIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzMzODE3NjcsImV4cCI6MjA4ODk1Nzc2N30.sMP754DR7s9MNBfE-Tplq_hIRpK02hzazGVY1RqPlhQ';
-const CF_WORKER     = 'https://ai.crownkeyuae.com';
+// ── CREDENTIALS: move real values to your backend .env ──────────────
+// NEVER commit real keys here. Frontend calls /api/* endpoints instead.
+const SUPABASE_URL  = window.CK_SUPABASE_URL  || 'https://fweagpbffngfrpuvxbda.supabase.co';
+const SUPABASE_KEY  = window.CK_SUPABASE_KEY  || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImZ3ZWFncGJmZm5nZnJwdXZ4YmRhIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzMzODE3NjcsImV4cCI6MjA4ODk1Nzc2N30.sMP754DR7s9MNBfE-Tplq_hIRpK02hzazGVY1RqPlhQ';
+const CF_WORKER     = window.CK_CF_WORKER     || 'https://ai.crownkeyuae.com';
+const API_BASE      = window.CK_API_BASE      || 'http://localhost:3000/api'; // backend proxy base
 const PAGE_SIZE     = 100;
-const MAX_ROWS      = 300000;
-const PF_API_KEY    = 'pGWAl.OYyyU2p6YKkriRoHV2LLE2WWYbhrIxnnIQ';
-const PF_API_SECRET = 'R5xPDTs94BQNhIjDyPFQjZZenPL358fU';
+// PF_API_KEY and PF_API_SECRET removed — proxied via backend /api/pf/lookup
 const PERMISSIONS = {
   can_search:{'label':'Search','icon':'🔍'},
   can_view_contacts:{'label':'View Contacts','icon':'📞'},
@@ -512,6 +513,8 @@ function showApp(){
   const _mp = localStorage.getItem('ck_meta_phone_id')||'810594372145616';
   if(_mt){ window.META_ACCESS_TOKEN=_mt; }
   window.META_PHONE_NUMBER_ID = _mp;
+  // FIX-02: start connection monitor here so it runs for both fresh logins and session resumes
+  startConnectionMonitor();
 }
 function logout(){sessionStorage.clear();location.reload();}
 let loginMethod = 'pin', _loginUser = null;
@@ -682,8 +685,9 @@ async function saveToCleandataRecords(recs){
   try{
     setSyncStatus('syncing');
     const batch=new Date().toISOString();
-    for(let i=0;i<recs.length;i+=500){
-      const b=recs.slice(i,i+500).map(r=>({
+    // FIX-01: batch size reduced 500→100 to match sbInsertBatch and avoid Supabase 413 errors
+    for(let i=0;i<recs.length;i+=100){
+      const b=recs.slice(i,i+100).map(r=>({
         name:r.name||'',mobile:r.mobile||'',secondary_mobile:r.secondary_mobile||'',
         phone3:r.phone3||'',email:r.email||'',email2:r.email2||'',
         building:r.building||'',unit_number:r.unit_number||'',floor:r.floor||'',
@@ -808,11 +812,7 @@ function addToIndexes(r){
 }
 let DB_TOTAL_COUNT = 0;
 async function fetchTotalCount(){
-  try{
-    const r = await sbFetch('/rest/v1/rpc/get_counts', null, 'POST');
-    if(r && r.total) { DB_TOTAL_COUNT = r.total; }
-  }catch(e){}
-  // Fallback: use count from a fast query
+  // FIX-03: removed broken 3-arg sbFetch RPC call; use reliable count=exact header query only
   try{
     const r2 = await fetch(SUPABASE_URL+'/rest/v1/records?select=id&limit=1', {
       headers:{'apikey':SUPABASE_KEY,'Authorization':'Bearer '+SUPABASE_KEY,'Prefer':'count=exact','Range':'0-0'}
@@ -844,16 +844,14 @@ function showPage(page,el){
     case 'dashboard': mc.innerHTML=renderDashboard(); break;
     case 'search':     mc.innerHTML=renderSearch(); break;
     case 'owners':
-      // Show immediately with local data, then load from Supabase
+      // FIX-07: consistent PAGE_SIZE=100 via LIMIT/OFFSET — load first page from Supabase
       filteredDB=[...DB]; currentPage=1;
       mc.innerHTML=renderRecordsPage('All Records (loading...)',filteredDB);
-      // Load first 500 from Supabase directly
       (async()=>{
         try{
-          const r = await sbFetch('/rest/v1/records?select=*&order=source_year.desc,id.desc&limit=500');
+          const r = await sbFetch('/rest/v1/records?select=*&order=source_year.desc,id.desc&limit='+PAGE_SIZE+'&offset=0');
           if(r&&r.length){
             filteredDB = r.map((x,i)=>normalizeSupabaseRecord(x,i));
-            // Merge into DB
             const existingIds = new Set(DB.map(x=>x.id));
             r.forEach((x,i)=>{ if(!existingIds.has(x.id)){ DB.push(normalizeSupabaseRecord(x,DB.length)); addToIndexes(DB[DB.length-1]); }});
             currentPage=1;
@@ -1093,8 +1091,8 @@ async function loadLiveDashboard(){
     if(hotEl){
       try{
         const [hotOwners, hotCrm] = await Promise.all([
-          // From CRM owners table
-          sbFetch('/rest/v1/owners?select=name,mobile,lead_score,lead_status,area_community&lead_score=gte.51&order=lead_score.desc&limit=5').catch(()=>[]),
+          // From CRM owners via backend API
+          fetch(API_BASE+'/owners/list?limit=5&offset=0').then(r=>r.ok?r.json().then(j=>j.data):Promise.resolve([])).catch(()=>[]),
           // From seller_leads if it exists
           sbFetch('/rest/v1/seller_leads?select=name,phone,score,stage&order=score.desc&limit=3').catch(()=>[]),
         ]);
@@ -1213,7 +1211,8 @@ async function doSearch(){
     if(resEl) resEl.innerHTML = '<div style="padding:20px;color:var(--text3);text-align:center">🔍 Searching '+DB_TOTAL_COUNT.toLocaleString()+' records...</div>';
 
     try{
-      let url = '/rest/v1/records?select=*&limit=300&order=source_year.desc,id.desc';
+      // FIX-07: use PAGE_SIZE constant for consistent LIMIT across all search queries
+      let url = '/rest/v1/records?select=*&limit='+PAGE_SIZE+'&order=source_year.desc,id.desc';
 
       if(q.length >= 2){
         if(searchTab==='permit'){
@@ -1239,7 +1238,7 @@ async function doSearch(){
       filteredDB = (results||[]).map((r,i)=>normalizeSupabaseRecord(r,i));
       currentPage = 1;
       mc.innerHTML = renderRecordsPage(
-        'Search Results — '+filteredDB.length.toLocaleString()+' found'+(DB_TOTAL_COUNT>300?' (showing top 300)':''),
+        'Search Results — '+filteredDB.length.toLocaleString()+' found'+(DB_TOTAL_COUNT>PAGE_SIZE?' (showing top '+PAGE_SIZE+')':''),
         filteredDB
       );
       return;
@@ -1251,7 +1250,8 @@ async function doSearch(){
   // No search terms — show first page from Supabase
   if(!q && !fCom && !fBld && !fYear && !fPhone){
     try{
-      const r = await sbFetch('/rest/v1/records?select=*&order=source_year.desc,id.desc&limit=500');
+      // FIX-07: consistent PAGE_SIZE limit
+      const r = await sbFetch('/rest/v1/records?select=*&order=source_year.desc,id.desc&limit='+PAGE_SIZE+'&offset=0');
       if(r&&r.length){
         filteredDB = r.map((x,i)=>normalizeSupabaseRecord(x,i));
         currentPage = 1;
@@ -2392,8 +2392,20 @@ function ruleBasedMapping(headers){const find=(aliases)=>{for(const a of aliases
 const BUILDING_INFER_MAP={'burj crown':{community:'Downtown Dubai'},'burj royale':{community:'Downtown Dubai'},'address downtown':{community:'Downtown Dubai'},'bellevue towers':{community:'Business Bay / Downtown Dubai'},'boulevard plaza':{community:'Downtown Dubai'},'downtown views':{community:'Downtown Dubai'},'burj lake hotel':{community:'Downtown Dubai'},'dubai mall residences':{community:'Downtown Dubai'},'parklane views':{community:'Dubai South'},'voi residence':{community:'Dubai South'},'cresswell residences':{community:'Dubai South'},'parkside':{community:'Dubai South'},'pulse villas':{community:'Dubai South'},'celestia':{community:'Dubai South'},'tenora':{community:'Dubai South'},'emaar oasis':{community:'Emaar Oasis'},'the valley':{community:'The Valley'}};
 function inferFromName(name){if(!name)return{};const low=name.toLowerCase().replace(/[_\-\.]/g,' ').replace(/\s+/g,' ').trim();const clean=low.replace(/\s*p\s*[&and]+\s*o\s*$/,'').trim();if(BUILDING_INFER_MAP[clean])return{building:titleCase(clean),...BUILDING_INFER_MAP[clean]};for(const[key,val]of Object.entries(BUILDING_INFER_MAP)){if(clean.includes(key)||key.includes(clean))return{building:titleCase(clean),...val};}return{building:titleCase(clean)};}
 function titleCase(s){return s.replace(/\w\S*/g,t=>t.charAt(0).toUpperCase()+t.slice(1));}
-async function processOneFile(item){const file=item.file;const ab=await file.arrayBuffer();const wb=XLSX.read(ab,{type:'array',dense:true,sheetRows:0});let added=0,skipped=0;const newRecords=[];for(const sname of wb.SheetNames){const rows=getSheetRows(wb,ab,sname);if(!rows||rows.length<2)continue;const{headerIdx,headers}=detectHeader(rows);if(headerIdx===-1)continue;const{mapping}=await getAIMapping(headers,rows.slice(headerIdx+1,headerIdx+6).map(r=>Object.fromEntries(headers.map((h,i)=>[h,r&&r[i]!==null&&r[i]!==undefined?String(r[i]).trim():'']))));const dataRows=rows.slice(headerIdx+1);for(const row of dataRows){if(!row)continue;const gr=(field)=>{const col=mapping[field];if(!col)return'';const idx=headers.findIndex(h=>h===col);if(idx<0||!row||idx>=row.length)return'';return cs(row[idx]);};const name=gr('name');if(!name||name.length<3)continue;const pnum=gr('p_number');if(pnum&&name&&pnumIndex.has(pnum+'|'+name.toUpperCase())){skipped++;continue;}const v1=validatePhone(String(row[headers.findIndex(h=>h===mapping.mobile)]||''));const mobile=v1.isValid?v1.normalized:'';const rec={id:DB.length+newRecords.length,name,mobile,secondary_mobile:'',phone3:'',email:gr('email'),email2:'',building:gr('building')||inferFromName(sname).building||'',unit_number:gr('unit_number'),floor:gr('floor'),rooms:gr('rooms'),actual_area:gr('actual_area'),area_community:gr('area_community')||inferFromName(sname).community||'',p_number:pnum,project:gr('project'),parking:gr('parking'),record_type:'Owner',lead_type:'',notes:'',source_file:file.name,source_year:new Date().getFullYear()};newRecords.push(rec);added++;if(pnum&&name)pnumIndex.set(pnum+'|'+name.toUpperCase(),rec);}}if(newRecords.length){DB.push(...newRecords);await saveToSupabase(newRecords);}item.added=added;item.skipped=skipped;}
-function getSheetRows(wb,ab,sname){try{const wbS=XLSX.read(ab,{type:'array',dense:true,sheets:sname});const ws=wbS.Sheets[sname];if(!ws||!ws['!ref'])return null;return XLSX.utils.sheet_to_json(ws,{defval:'',raw:false,header:1});}catch{return null;}}
+// FIX-06: sheetRows removed (was 0 = no limit, caused freeze). Parse is now done once;
+// getSheetRows reuses the wb object instead of re-reading the ArrayBuffer.
+async function processOneFile(item){const file=item.file;const ab=await file.arrayBuffer();const wb=XLSX.read(ab,{type:'array',dense:true});let added=0,skipped=0;const newRecords=[];for(const sname of wb.SheetNames){const rows=getSheetRows(wb,sname);if(!rows||rows.length<2)continue;if(rows.length>20000){showToast('Large file: '+file.name+' ('+rows.length.toLocaleString()+' rows) — processing, please wait…','');}const{headerIdx,headers}=detectHeader(rows);if(headerIdx===-1)continue;const{mapping}=await getAIMapping(headers,rows.slice(headerIdx+1,headerIdx+6).map(r=>Object.fromEntries(headers.map((h,i)=>[h,r&&r[i]!==null&&r[i]!==undefined?String(r[i]).trim():'']))));const dataRows=rows.slice(headerIdx+1);for(const row of dataRows){if(!row)continue;const gr=(field)=>{const col=mapping[field];if(!col)return'';const idx=headers.findIndex(h=>h===col);if(idx<0||!row||idx>=row.length)return'';return cs(row[idx]);};const name=gr('name');if(!name||name.length<3)continue;const pnum=gr('p_number');if(pnum&&name&&pnumIndex.has(pnum+'|'+name.toUpperCase())){skipped++;continue;}const v1=validatePhone(String(row[headers.findIndex(h=>h===mapping.mobile)]||''));const mobile=v1.isValid?v1.normalized:'';const rec={id:DB.length+newRecords.length,name,mobile,secondary_mobile:'',phone3:'',email:gr('email'),email2:'',building:gr('building')||inferFromName(sname).building||'',unit_number:gr('unit_number'),floor:gr('floor'),rooms:gr('rooms'),actual_area:gr('actual_area'),area_community:gr('area_community')||inferFromName(sname).community||'',p_number:pnum,project:gr('project'),parking:gr('parking'),record_type:'Owner',lead_type:'',notes:'',source_file:file.name,source_year:new Date().getFullYear()};newRecords.push(rec);added++;if(pnum&&name)pnumIndex.set(pnum+'|'+name.toUpperCase(),rec);}}if(newRecords.length){DB.push(...newRecords);await saveToSupabase(newRecords);}item.added=added;item.skipped=skipped;}
+// FIX-06: getSheetRows now uses the already-parsed wb object instead of re-reading ab,
+// eliminating the double-parse. Empty rows are filtered before returning.
+function getSheetRows(wb,sname){
+  try{
+    const ws=wb.Sheets[sname];
+    if(!ws||!ws['!ref'])return null;
+    const rows=XLSX.utils.sheet_to_json(ws,{defval:'',raw:false,header:1});
+    // Filter out rows where every cell is empty/whitespace — prevents blank record inserts
+    return rows.filter(row=>Array.isArray(row)&&row.some(cell=>String(cell||'').trim()!==''));
+  }catch{return null;}
+}
 function detectHeader(rows){const NAME_KW=['name','owner name','owner_name','buyer name','client name','ownername','full name'];const PHONE_KW=['mobile','phone','telephone','contact'];const OTHER_KW=['email','unit','flat','villa','building','project','floor','rooms','area','community','permit','p-number'];for(let ri=0;ri<Math.min(30,rows.length);ri++){const vals=rows[ri].map(v=>String(v||'').toLowerCase().trim());const filled=vals.filter(v=>v).length;if(filled<2)continue;const hasName=vals.some(v=>NAME_KW.some(k=>v===k||(k.length>4&&v.includes(k))));const hasPhone=vals.some(v=>PHONE_KW.some(k=>v.includes(k)));const hasOther=vals.some(v=>OTHER_KW.some(k=>v.includes(k)));if(hasName||hasPhone)return{headerIdx:ri,headers:rows[ri].map(v=>String(v||'').trim())};if(hasOther&&filled>=4)return{headerIdx:ri,headers:rows[ri].map(v=>String(v||'').trim())};}return{headerIdx:-1,headers:[]};}
 function findIdx(hLow,aliases){return hLow.findIndex(h=>aliases.some(a=>h===a||(a.length>4&&h.includes(a))));}
 function cs(v){if(v===null||v===undefined)return'';const s=String(v).trim().replace(/\.0$/,'');if(s.startsWith('#')||s==='N/A'||s==='#N/A'||s==='#REF!'||s==='#VALUE!'||s==='#NAME?'||s==='#DIV/0!'||s==='#NULL!'||s==='#NUM!')return'';return s;}
@@ -2473,7 +2485,7 @@ async function runDedupDryRun(){
   if(el) el.innerHTML = '<div style="color:var(--text3);padding:12px">⏳ Scanning for duplicates...</div>';
   try{
     // Count duplicates via Supabase SQL
-    const result = await sbFetch('/rest/v1/rpc/count_duplicates', null, 'POST');
+    const result = await sbFetch('/rest/v1/rpc/count_duplicates',{method:'POST',body:JSON.stringify({})});
     if(el) el.innerHTML = `<div style="color:var(--gold);padding:12px;font-size:14px">Found ${(result||0).toLocaleString()} potential duplicate rows. Click "Scan & Remove Duplicates" to clean them.</div>`;
   }catch(e){
     // Fallback: show SQL to run manually
@@ -2640,9 +2652,47 @@ async function runDataAudit(){
   }catch(e){el.innerHTML=`<div style="color:var(--red);padding:14px">Error: ${e.message}</div>`;}
 }
 function runDedup(){const before=DB.length;const seen=new Map();const clean=[];for(const r of DB){const pnum=(r.p_number||'').trim();const name=(r.name||'').toUpperCase().trim();if(pnum&&name){const key=pnum+'|'+name;if(seen.has(key))continue;seen.set(key,true);}clean.push(r);}const removed=before-clean.length;DB=clean;rebuildIndexes();updateHeaderCounts();document.getElementById('dedup-result').innerHTML=`<div style="color:var(--green)">✅ Done — ${removed} duplicates removed</div>`;showToast(`Dedup: ${removed} removed`,'success');}
-async function clearAllData(){if(!confirm('Clear ALL records?'))return;try{await sbFetch('/rest/v1/records?id=gte.0',{method:'DELETE'});}catch(e){console.warn(e);}DB=[];rebuildIndexes();updateHeaderCounts();showToast('Cleared','success');}
+async function clearAllData(){if(!currentUser?.isAdmin){showToast('Admin access required','error');return;}if(!confirm('Clear ALL records? This cannot be undone.'))return;try{await sbFetch('/rest/v1/records?id=gte.0',{method:'DELETE'});}catch(e){console.warn(e);}DB=[];rebuildIndexes();updateHeaderCounts();showToast('Cleared','success');}
 function renderPermitLookup(){return`<div class="page-title">Permit Lookup</div><div class="page-sub">P-Number instant search</div><div class="panel"><div class="search-row"><div class="input-wrap"><label>P-Number</label><input class="s-input" id="pnum-input" placeholder="Enter permit number" onkeydown="if(event.key==='Enter')searchByPermit()"></div><button class="btn-gold" onclick="searchByPermit()">🔍 FIND OWNER</button></div><div id="pnum-results" style="margin-top:18px"></div></div>`;}
-function searchByPermit(){const q=document.getElementById('pnum-input').value.trim().replace(/\D/g,'');if(!q)return;let results=DB.filter(r=>r.p_number&&(r.p_number.replace(/\D/g,'')===q||r.p_number.includes(q)));const div=document.getElementById('pnum-results');if(!results.length){div.innerHTML=`<div style="color:var(--text3);padding:14px">No records for P-Number: <strong style="color:var(--gold)">${q}</strong></div>`;}else{div.innerHTML=`<div style="color:var(--green);margin-bottom:10px;font-size:12px">✅ ${results.length} record(s) found</div>`+renderTable(results,1);}}
+async function searchByPermit(){
+  const q=document.getElementById('pnum-input').value.trim().replace(/\D/g,'');
+  if(!q)return;
+  const div=document.getElementById('pnum-results');
+  div.innerHTML='<div style="color:var(--text3);padding:14px">🔍 Looking up permit...</div>';
+
+  // 1. Try backend PF API
+  try{
+    const res = await fetch('/api/pf/lookup?permit='+encodeURIComponent(q));
+    if(res.ok){
+      const data = await res.json();
+      if(data.found && data.results.length){
+        div.innerHTML=`<div style="color:var(--green);margin-bottom:10px;font-size:12px">✅ ${data.results.length} result(s) from Property Finder</div>`+
+          data.results.map(p=>`
+          <div style="background:var(--dark3);border:1px solid var(--border);border-radius:10px;padding:14px;margin-bottom:10px;font-size:13px">
+            <div style="font-weight:600;color:var(--gold);margin-bottom:6px">${p.permit_number}</div>
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;font-size:12px">
+              <div><span style="color:var(--text3)">Building:</span> ${p.building||'—'}</div>
+              <div><span style="color:var(--text3)">Unit:</span> ${p.unit_number||'—'}</div>
+              <div><span style="color:var(--text3)">Community:</span> ${p.community||'—'}</div>
+              <div><span style="color:var(--text3)">Beds:</span> ${p.bedrooms??'—'}</div>
+              <div><span style="color:var(--text3)">Area:</span> ${p.area_sqft?p.area_sqft+' sqft':'—'}</div>
+              <div><span style="color:var(--text3)">Status:</span> ${p.status||'—'}</div>
+            </div>
+            ${p.url?`<a href="${p.url}" target="_blank" style="font-size:11px;color:var(--gold);margin-top:8px;display:inline-block">View on Property Finder →</a>`:''}
+          </div>`).join('');
+        return;
+      }
+    }
+  }catch(e){ /* fall through to local */ }
+
+  // 2. Fallback: local DB search
+  const results=DB.filter(r=>r.p_number&&(r.p_number.replace(/\D/g,'')===q||r.p_number.includes(q)));
+  if(!results.length){
+    div.innerHTML=`<div style="color:var(--text3);padding:14px">No records for P-Number: <strong style="color:var(--gold)">${q}</strong></div>`;
+  }else{
+    div.innerHTML=`<div style="color:var(--green);margin-bottom:10px;font-size:12px">✅ ${results.length} record(s) found (local)</div>`+renderTable(results,1);
+  }
+}
 function renderAddRecord(){return`<div class="page-title">Add Record</div><div class="page-sub">Manually add a property owner or lead</div><div class="panel"><div class="panel-title">New Record</div><div style="display:grid;grid-template-columns:1fr 1fr;gap:14px"><div class="input-wrap" style="grid-column:1/-1"><label>Owner / Lead Name *</label><input class="s-input" id="ar-name" placeholder="Full Name"></div><div class="input-wrap"><label>Mobile Number</label><input class="s-input" id="ar-mobile" placeholder="+971 50 123 4567" oninput="validateArPhone()"><div id="ar-phone-status" style="font-size:11px;margin-top:5px;color:var(--text3)"></div></div><div class="input-wrap"><label>Email</label><input class="s-input" id="ar-email" placeholder="name@email.com"></div><div class="input-wrap"><label>Building</label><input class="s-input" id="ar-building" placeholder="Tower/Building name"></div><div class="input-wrap"><label>Unit Number</label><input class="s-input" id="ar-unit" placeholder="e.g. 1204"></div><div class="input-wrap"><label>Community / Area</label><input class="s-input" id="ar-community" placeholder="e.g. Downtown Dubai"></div><div class="input-wrap"><label>Permit (P-Number)</label><input class="s-input" id="ar-pnum" placeholder="e.g. 71234567"></div><div class="input-wrap"><label>Rooms</label><select class="s-input" id="ar-rooms"><option value="">Select...</option><option>Studio</option><option>1 B/R</option><option>2 B/R</option><option>3 B/R</option><option>4 B/R</option><option>5+ B/R</option></select></div><div class="input-wrap"><label>Type</label><select class="s-input" id="ar-type"><option value="Owner">Owner</option><option value="Lead">Lead</option></select></div><div class="input-wrap"><label>Year</label><input class="s-input" id="ar-year" value="${new Date().getFullYear()}" type="number"></div></div><div style="margin-top:18px;display:flex;gap:10px"><button class="btn-gold" onclick="addManualRecord()">➕ Add Record</button><button class="btn-outline" onclick="clearAddRecord()">Clear</button></div><div id="ar-result" style="margin-top:14px"></div></div>`;}
 function validateArPhone(){const raw=document.getElementById('ar-mobile')?.value;const s=document.getElementById('ar-phone-status');if(!raw||!raw.trim()){s.textContent='';return;}const v=validatePhone(raw);s.innerHTML=v.isValid?`<span style="color:var(--green)">✓ Valid: ${v.formatted}</span>`:`<span style="color:var(--red)">✗ Invalid: ${v.reason}</span>`;}
 function addManualRecord(){const name=(document.getElementById('ar-name')?.value||'').trim().toUpperCase();if(!name){showToast('Name is required','error');return;}const rawMobile=document.getElementById('ar-mobile')?.value.trim();const mv=validatePhone(rawMobile);const mobile=rawMobile?(mv.isValid?mv.normalized:'INVALID_'+rawMobile.slice(0,30)):'';const rec={id:DB.length,name,mobile,secondary_mobile:'',phone3:'',email:(document.getElementById('ar-email')?.value||'').trim(),email2:'',building:cs(document.getElementById('ar-building')?.value),unit_number:cs(document.getElementById('ar-unit')?.value),floor:'',rooms:document.getElementById('ar-rooms')?.value||'',actual_area:'',area_community:cs(document.getElementById('ar-community')?.value),p_number:cs(document.getElementById('ar-pnum')?.value).replace(/\D/g,''),project:'',parking:'',source_year:parseInt(document.getElementById('ar-year')?.value)||new Date().getFullYear(),record_type:document.getElementById('ar-type')?.value||'Owner',lead_type:'',notes:'',source_file:'Manual Entry'};DB.push(rec);addToIndexes(rec);filteredDB=[...DB];updateHeaderCounts();saveToSupabase([rec]);document.getElementById('ar-result').innerHTML=`<div style="color:var(--green);padding:12px;background:rgba(90,191,142,.1);border:1px solid rgba(90,191,142,.3);border-radius:8px">✅ Record added: <strong>${name}</strong></div>`;showToast('Record added: '+name,'success');clearAddRecord();}
@@ -3214,9 +3264,9 @@ let toastTimer;
 function showToast(msg,type=''){const t=document.getElementById('toast');if(!t)return;t.textContent=msg;t.className='toast'+(type?' '+type:'');t.classList.add('show');clearTimeout(toastTimer);toastTimer=setTimeout(()=>t.classList.remove('show'),3000);}
 
 // ═══════════════════════════════════════════════════════
-// CROWNKEY CRM ADDON — V10
+// CROWNKEY CRM ADDON — V12
 // Hot Leads · Campaigns · Meetings · Deals
-// Connects to existing SUPABASE_URL / SUPABASE_KEY from v9
+// Connects to existing SUPABASE_URL / SUPABASE_KEY
 // ═══════════════════════════════════════════════════════
 
 // ═══════════════════════════════════════════════════════
@@ -3380,7 +3430,7 @@ async function markConverted(id){
 
 // ── CAMPAIGNS PAGE ───────────────────────────────────
 // ═══════════════════════════════════════════════════════════════════
-// CROWNKEY CAMPAIGNS V2 — FULL WATI-LEVEL OUTREACH COMMAND CENTER
+// CROWNKEY CAMPAIGNS V2 — META CLOUD API OUTREACH COMMAND CENTER
 // Meta Template Sync · AI Agent · Auto Calls · Bot Replies · Auto Follow-ups
 // ═══════════════════════════════════════════════════════════════════
 
@@ -3585,7 +3635,7 @@ async function pauseCampaign(id) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// NEW CAMPAIGN MODAL — FULL WATI-LEVEL
+// NEW CAMPAIGN MODAL — META CLOUD API
 // ═══════════════════════════════════════════════════════════════════
 function openNewCampaignModal() {
   const communities = [...communityIndex.keys()].sort();
@@ -6650,22 +6700,10 @@ async function exportFunnel(type) {
 
 
 
-// ═══ WHATSJET NATIVE INTEGRATION ═══
-
-// ═══════════════════════════════════════════════════════════════
-// WHATSJET INTEGRATION — Native WhatsApp from inside CRM
-// Base: https://crownkey.online/api
-// ═══════════════════════════════════════════════════════════════
-
-const WJ_BASE  = 'https://crownkey.online/api';
-const WJ_UID   = 'a5696bc9-71b7-4421-a002-41863beac74b';
-const WJ_TOKEN = 'jdFQt9PzvjrY6iSZBsaoOUK3b82qcqDoe7s45TaYHzZp6UKC5WMd625CsSLfWWod';
-
 // ── Core API call ─────────────────────────────────────────────
 // ═══════════════════════════════════════════════════════════════════
-// META CLOUD API DIRECT — Replaces WhatsJet/WATI entirely
-// Phone Number ID: 810594372145616 | WABA: 2277087452721670
-// Sending number: +971 54 273 2522
+// META CLOUD API DIRECT
+// Phone Number ID configured via META_PHONE_NUMBER_ID
 // ═══════════════════════════════════════════════════════════════════
 
 function metaGetToken(){ return window.META_ACCESS_TOKEN || localStorage.getItem('ck_meta_token') || ''; }
@@ -6717,117 +6755,19 @@ async function metaSendTemplate(phone, templateName, languageCode='en', componen
 
 async function metaLogOutreach(phone, ownerName, templateName, wamid, status='sent'){
   try {
-    await sbFetch('/rest/v1/outreach_log','POST',{
+    await sbFetch('/rest/v1/outreach_log',{method:'POST',prefer:'return=minimal',body:JSON.stringify({
       phone, owner_name:ownerName, channel:'whatsapp',
       message_body:'[Template: '+templateName+']',
       status, wamid, direction:'outbound',
       created_at: new Date().toISOString()
-    });
+    })});
   } catch(e){ /* silent — don't let logging break campaign */ }
 }
 
-// Legacy compatibility shims — these used to call WhatsJet
-async function wjSendMessage(phone, message){ throw new Error('Free-text messages not allowed by Meta. Use templates. Go to WA Campaign Center → compose with a template.'); }
+// FIX-08: Legacy WhatsJet functions removed. wjSendTemplate shim kept for call-site compatibility.
+async function wjSendMessage(phone, message){ throw new Error('Free-text messages not allowed by Meta. Use templates via WA Campaign Center.'); }
 async function wjSendTemplate(phone, templateName, languageCode='en', components=[]){
   return await metaSendTemplate(phone, templateName, languageCode, components);
-}
-
-// ── Legacy WhatsJet fetch (disabled — kept to prevent reference errors) ──
-async function wjFetch(endpoint, method='GET', body=null){
-  const url = `${WJ_BASE}/${WJ_UID}/${endpoint}?token=${WJ_TOKEN}`;
-  const opts = {
-    method,
-    headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
-  };
-  if (body) opts.body = JSON.stringify(body);
-  const resp = await fetch(url, opts);
-  if (!resp.ok) {
-    const err = await resp.text();
-    throw new Error(`WhatsJet ${resp.status}: ${err.slice(0,200)}`);
-  }
-  return await resp.json();
-}
-
-// ── Send single WhatsApp message ──────────────────────────────
-async function wjSendMessage(phone, message, onSuccess, onError){
-  try {
-    // Normalize phone
-    const cleanPhone = String(phone).replace(/\D/g,'');
-    const result = await wjFetch('contact/send-message', 'POST', {
-      phone_number: cleanPhone,
-      message: message,
-    });
-    if (onSuccess) onSuccess(result);
-    return result;
-  } catch(e) {
-    if (onError) onError(e);
-    throw e;
-  }
-}
-
-// ── Send template message ─────────────────────────────────────
-async function wjSendTemplate(phone, templateName, languageCode='en', components=[]){
-  const cleanPhone = String(phone).replace(/\D/g,'');
-  return await wjFetch('contact/send-template-message', 'POST', {
-    phone_number: cleanPhone,
-    template_name: templateName,
-    language_code: languageCode,
-    components: components,
-  });
-}
-
-// ── Get contacts from WhatsJet ────────────────────────────────
-async function wjGetContacts(page=1){
-  return await wjFetch(`contacts?page=${page}`);
-}
-
-// ── Create/update contact in WhatsJet ─────────────────────────
-async function wjCreateContact(name, phone, email='', groups=''){
-  const cleanPhone = String(phone).replace(/\D/g,'');
-  return await wjFetch('contact', 'POST', {
-    phone_number: cleanPhone,
-    name: name,
-    email: email,
-    groups: groups,
-  });
-}
-
-// ── Sync contacts to WhatsJet (bulk) ─────────────────────────
-async function wjSyncContacts(records, onProgress){
-  let synced = 0;
-  const errors = [];
-  for (const rec of records) {
-    if (!rec.mobile) continue;
-    try {
-      await wjCreateContact(rec.name, rec.mobile, rec.email||'');
-      synced++;
-      if (onProgress) onProgress(synced, records.length);
-      await new Promise(r=>setTimeout(r,100)); // Rate limit
-    } catch(e) {
-      errors.push({name: rec.name, error: e.message});
-    }
-  }
-  return { synced, errors };
-}
-
-// ── Get templates from WhatsJet ───────────────────────────────
-async function wjGetTemplates(){
-  try {
-    return await wjFetch('templates');
-  } catch(e) {
-    console.warn('WhatsJet templates error:', e);
-    return [];
-  }
-}
-
-// ── Create campaign in WhatsJet ───────────────────────────────
-async function wjCreateCampaign(name, templateName, contacts, scheduledAt=null){
-  return await wjFetch('campaign', 'POST', {
-    name: name,
-    template_name: templateName,
-    contacts: contacts, // array of phone numbers
-    scheduled_at: scheduledAt,
-  });
 }
 
 // ── SEND MESSAGE MODAL ─────────────────────────────────────────
@@ -6970,13 +6910,13 @@ async function wjDoSend(name){
 
     // Log interaction to Supabase
     try {
-      await sbFetch('/rest/v1/interactions', 'POST', {
+      await sbFetch('/rest/v1/interactions',{method:'POST',prefer:'return=minimal',body:JSON.stringify({
         owner_name: name,
         channel: 'whatsapp',
         direction: 'outbound',
         message: activeTab==='text' ? document.getElementById('wj-message')?.value?.trim() : 'Template: '+document.getElementById('wj-template-select')?.value,
         status: 'sent',
-      });
+      })});
     } catch(e) { /* silent */ }
 
     setTimeout(()=>document.getElementById('wj-modal')?.remove(), 2000);
@@ -7117,13 +7057,13 @@ async function wjLaunchCampaign(contacts){
 
   // Save campaign to Supabase
   try {
-    await sbFetch('/rest/v1/campaigns','POST',{
+    await sbFetch('/rest/v1/campaigns',{method:'POST',prefer:'return=minimal',body:JSON.stringify({
       name: name||'WhatsApp Campaign',
       channel:'whatsapp', status:'running',
       total_recipients: contacts.length,
       audience_community: contacts[0]?.community||'',
       custom_message:'[Template: '+templateName+']',
-    });
+    })});
   } catch(e){ /* continue */ }
 
   for(let i=0; i<contacts.length; i++){
@@ -7160,9 +7100,9 @@ async function wjLaunchCampaign(contacts){
 
   // Update campaign stats in Supabase
   try {
-    await sbFetch('/rest/v1/campaigns?name=eq.'+encodeURIComponent(name||'WhatsApp Campaign'),'PATCH',{
+    await sbFetch('/rest/v1/campaigns?name=eq.'+encodeURIComponent(name||'WhatsApp Campaign'),{method:'PATCH',prefer:'return=minimal',body:JSON.stringify({
       status:'completed', sent_count:sent
-    });
+    })});
   } catch(e){ /* silent */ }
 
   window._campStop = false;
@@ -7856,7 +7796,7 @@ function buildCustomSegment(){
 // ═══════════════════════════════════════════════════════════════════
 // V11 MODULE 6 — DASHBOARD IMPROVEMENTS
 // Enhanced stats: live email count, better CRM row
-// V11 MODULE 6 — Dashboard note: V10 renderDashboard is preserved as-is.
+// V11 MODULE 6 — Dashboard note: renderDashboard is preserved as-is.
 // Dashboard title already updated via header/loading screen strings above.
 
 // ═══════════════════════════════════════════════════════════════════
@@ -8081,7 +8021,7 @@ doSearch = async function(){
     const resEl = document.getElementById('search-results');
     if(resEl) resEl.innerHTML = '<div style="padding:20px;color:var(--text3);text-align:center">🔍 Searching '+DB_TOTAL_COUNT.toLocaleString()+' records...</div>';
     try{
-      let url = '/rest/v1/records?select=*&limit=300&order=source_year.desc,id.desc';
+      let url = '/rest/v1/records?select=*&limit='+PAGE_SIZE+'&order=source_year.desc,id.desc';
       if(q.length>=2){
         if(searchTab==='permit')       url+='&p_number=ilike.*'+encodeURIComponent(q.replace(/\D/g,''))+'*';
         else if(searchTab==='mobile')  url+='&or=(mobile.ilike.*'+encodeURIComponent(q.replace(/\D/g,''))+'*,secondary_mobile.ilike.*'+encodeURIComponent(q.replace(/\D/g,''))+'*)';
@@ -8100,7 +8040,7 @@ doSearch = async function(){
       filteredDB = (results||[]).map((r,i)=>normalizeSupabaseRecord(r,i));
       currentPage = 1;
       const mc2 = document.getElementById('main-content');
-      if(mc2) mc2.innerHTML = renderRecordsPage('Search Results — '+filteredDB.length.toLocaleString()+' found'+(DB_TOTAL_COUNT>300?' (top 300)':''), filteredDB);
+      if(mc2) mc2.innerHTML = renderRecordsPage('Search Results — '+filteredDB.length.toLocaleString()+' found'+(DB_TOTAL_COUNT>PAGE_SIZE?' (top '+PAGE_SIZE+')':''), filteredDB);
       return;
     }catch(e){ console.warn('Search error, falling back to local:',e.message); }
   }
@@ -8110,8 +8050,8 @@ doSearch = async function(){
   if(mc2) mc2.innerHTML = renderRecordsPage('All Records', filteredDB);
 };
 
-startConnectionMonitor();
-console.log('V11 Modules loaded ✓ — AI Chat · Valuation · Timeline · Segments · Theme · CRM Improvements');
+// FIX-02: startConnectionMonitor() moved into showApp() — removed standalone call here
+console.log('V12 Modules loaded ✓ — AI Chat · Valuation · Timeline · Segments · Theme · CRM Improvements');
 
 // ═══════════════════════════════════════════════════════════════════
 // AUTONOMOUS OS MODULE 1 — BUYER REQUIREMENTS
@@ -8527,7 +8467,8 @@ function renderLeadPipeline(){
 async function loadLeadPipeline(force=false){
   try{
     // Load from owners CRM table
-    const owners = await sbFetch('/rest/v1/owners?select=*&order=lead_score.desc&limit=300').catch(()=>null);
+    const _ownRes = await fetch(API_BASE+'/owners/list?limit='+PAGE_SIZE+'&offset=0').catch(()=>null);
+    const owners = _ownRes?.ok ? (await _ownRes.json()).data : null;
 
     if(!owners || !owners.length){
       // Fallback: build from local DB using lead scoring
@@ -9042,8 +8983,8 @@ function saveBotRules(){
   }
   localStorage.setItem('ck_bot_rules', JSON.stringify(rules));
   // Also save to Supabase for webhook server to read
-  sbFetch('/rest/v1/bot_rules','DELETE',null,'keyword=neq.NULL').catch(()=>{});
-  Promise.all(rules.map(r=>sbFetch('/rest/v1/bot_rules','POST',r))).then(()=>{
+  sbFetch('/rest/v1/bot_rules?keyword=neq.NULL',{method:'DELETE'}).catch(()=>{});
+  Promise.all(rules.map(r=>sbFetch('/rest/v1/bot_rules',{method:'POST',prefer:'return=minimal',body:JSON.stringify(r)}))).then(()=>{
     showToast('Bot rules saved ✓ — webhook server will pick up changes','success');
   }).catch(()=>{ showToast('Saved locally. Supabase sync failed — bot_rules table may need creating.',''); });
 }
@@ -9281,7 +9222,7 @@ const app = express();
 app.use(express.json());
 
 const SB = createClient(
-  'https://fweagpbffngfrpuvxbda.supabase.co',
+  process.env.SUPABASE_URL,
   process.env.SUPABASE_SERVICE_KEY  // use service key, not anon
 );
 const META_TOKEN = process.env.META_TOKEN;
@@ -9611,7 +9552,7 @@ async function updateWALaunchSummary(){
 
   try {
     const key = window.SUPABASE_KEY || localStorage.getItem('ck_supa_key') || '';
-    const r = await fetch(`${window.SUPABASE_URL||'https://fweagpbffngfrpuvxbda.supabase.co'}/rest/v1/records?select=id${filter}&not.mobile.is.null&mobile.neq.`, {
+    const r = await fetch(`${window.SUPABASE_URL||window.CK_SUPABASE_URL||''}/rest/v1/records?select=id${filter}&not.mobile.is.null&mobile.neq.`, {
       headers:{'apikey':key,'Authorization':'Bearer '+key,'Prefer':'count=exact','Range':'0-0'}
     });
     const total = parseInt(r.headers.get('content-range')?.split('/')[1]||'0');
