@@ -35,7 +35,14 @@ async function sbFetch(path, opts = {}) {
   // Return { data, count } — count only present when Prefer: count=exact
   const contentRange = res.headers.get('content-range');
   const count = contentRange ? parseInt(contentRange.split('/')[1], 10) : null;
-  const data = await res.json();
+
+  // 204 No Content or empty body (return=minimal) — nothing to parse
+  if (res.status === 204 || res.headers.get('content-length') === '0') {
+    return { data: null, count };
+  }
+  const text = await res.text();
+  if (!text) return { data: null, count };
+  const data = JSON.parse(text);
   return { data, count };
 }
 

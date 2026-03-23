@@ -581,7 +581,7 @@ async function loadFromSupabase(){
 
     // Get total count via SQL RPC
     try {
-      const countRes = await sbFetch('/rest/v1/records?select=id&limit=1&offset=0', {}, 'HEAD');
+      const countRes = await fetch(API_BASE+'/records/count').catch(()=>null);
     } catch(e){}
 
     // Get dashboard stats only - no bulk data loading
@@ -603,29 +603,24 @@ async function refreshDashboardStats(){
     // Q2: Get 2000 records for local indexes (name, building, community)
     // Q3: Get phone/email counts
     const [countRes, records, phoneRes] = await Promise.all([
-      fetch(SUPABASE_URL+'/rest/v1/records?select=id&limit=1', {
-        headers:{'apikey':SUPABASE_KEY,'Authorization':'Bearer '+SUPABASE_KEY,
-                 'Prefer':'count=exact','Range':'0-0'}
-      }),
-      sbFetch('/rest/v1/records?select=name,mobile,secondary_mobile,email,building,unit_number,area_community,p_number,source_year,floor,rooms,actual_area,record_type,source_file,flag&order=source_year.desc,id.desc&limit=2000'),
-      fetch(SUPABASE_URL+'/rest/v1/records?select=id&mobile=neq.&limit=1', {
-        headers:{'apikey':SUPABASE_KEY,'Authorization':'Bearer '+SUPABASE_KEY,
-                 'Prefer':'count=exact','Range':'0-0'}
-      }),
+      fetch(API_BASE+'/records/count'),
+      fetch(API_BASE+'/records/list?limit=2000&offset=0'),
+      fetch(API_BASE+'/records/count?phone=with'),
     ]);
 
     // Extract total count
-    const cr = countRes.headers.get('content-range');
-    if(cr){ const n=parseInt(cr.split('/')[1]); if(!isNaN(n)) DB_TOTAL_COUNT=n; }
+    const cr = countRes.ok ? (await countRes.json()).count : 0;
+    if(cr) DB_TOTAL_COUNT = cr;
 
     // Extract phone count
-    const pcr = phoneRes.headers.get('content-range');
     let phoneCount = 0;
-    if(pcr){ const n=parseInt(pcr.split('/')[1]); if(!isNaN(n)) phoneCount=n; }
+    if(phoneRes.ok){ const pd=await phoneRes.json(); phoneCount=pd.count||0; }
 
     // Load records into DB
-    if(records && records.length){
-      DB = records.map((r,i) => normalizeSupabaseRecord(r,i));
+    const recJson = records.ok ? await records.json() : null;
+    const recData = recJson?.data || [];
+    if(recData.length){
+      DB = recData.map((r,i) => normalizeSupabaseRecord(r,i));
       rebuildIndexes();
     }
 
@@ -703,25 +698,54 @@ async function saveToCleandataRecords(recs){
   }catch(e){console.warn('cleandata save error:',e);setSyncStatus('offline');throw e;}
 }
 function toSbRow(r){
-  return{name:r.name||'',mobile:r.mobile||'',secondary_mobile:r.secondary_mobile||'',
-    email:r.email||'',building:r.building||'',unit_number:r.unit_number||'',
-    floor:r.floor||'',rooms:r.rooms||'',actual_area:r.actual_area||'',
-    area_community:r.area_community||'',p_number:r.p_number||'',
-    project:r.project||'',parking:r.parking||'',record_type:r.record_type||'Owner',
-    lead_type:r.lead_type||'',notes:r.notes||'',source_file:r.source_file||'',
-    source_year:r.source_year||null,flag:r.flag||'',
-    import_batch:r.import_batch||new Date().toISOString().slice(0,10)};
+  return{
+    name:r.name||'',
+    mobile:r.mobile||'',
+    secondary_mobile:r.secondary_mobile||'',
+    email:r.email||'',
+    building:r.building||'',
+    unit_number:r.unit_number||'',
+    rooms:r.rooms||'',
+    area_community:r.area_community||'',
+    p_number:r.p_number||'',
+    record_type:r.record_type||'Owner',
+    source_file:r.source_file||'',
+    source_year:r.source_year||null,
+    flag:r.flag||''
+  };
 }
 async function sbInsertBatch(rows){
-  const BATCH=100;let totalSaved=0;
+  const BATCH=100; let totalSaved=0;
   for(let i=0;i<rows.length;i+=BATCH){
     const slice=rows.slice(i,i+BATCH);
     let ok=false;
     for(let t=1;t<=3;t++){
-      try{await sbFetch('/rest/v1/records',{method:'POST',prefer:'return=minimal',body:JSON.stringify(slice)});ok=true;totalSaved+=slice.length;break;}
-      catch(e){console.warn('Batch attempt '+t+' failed:',e.message);if(t<3)await new Promise(r=>setTimeout(r,1500*t));}
+      try{
+        const res=await fetch(API_BASE+'/records/upload',{
+          method:'POST',
+          headers:{'Content-Type':'application/json'},
+          body:JSON.stringify({rows:slice})
+        });
+        const body=await res.text();
+        if(res.ok){ok=true;totalSaved+=slice.length;break;}
+        throw new Error(body||'HTTP '+res.status);
+      }catch(e){
+        if(t<3)await new Promise(r=>setTimeout(r,1500*t));
+      }
     }
-    if(!ok){for(const row of slice){try{await sbFetch('/rest/v1/records',{method:'POST',prefer:'return=minimal',body:JSON.stringify([row])});totalSaved++;}catch(e2){console.error('Single insert failed:',row.name,e2.message);}}}
+    if(!ok){
+      const VALID_SB=['name','mobile','secondary_mobile','email','building','unit_number','area_community','p_number','source_year','rooms','record_type','flag','source_file'];
+      let fallbackOk=false;
+      for(const row of slice){
+        try{
+          const clean=Object.fromEntries(Object.entries(row).filter(([k])=>VALID_SB.includes(k)));
+          await sbFetch('/rest/v1/records',{method:'POST',prefer:'return=minimal',body:JSON.stringify([clean])});
+          totalSaved++;
+          fallbackOk=true;
+        }catch(e2){}
+      }
+      if(!fallbackOk) throw new Error('Upload failed — backend and Supabase both unreachable. Check your connection and try again.');
+    }
     if(i+BATCH<rows.length)await new Promise(r=>setTimeout(r,80));
   }
   return totalSaved;
@@ -735,7 +759,10 @@ async function saveToSupabase(recs,opts={}){
     setSyncStatus('cloud');
     if(opts.onProgress)opts.onProgress(saved,rows.length);
     return saved;
-  }catch(e){console.error('saveToSupabase fatal:',e);setSyncStatus('offline');return 0;}
+  }catch(e){
+    setSyncStatus('offline');
+    throw e;
+  }
 }
 // Smart connection monitor — only shows Offline after 2 consecutive failures
 let _connFailCount = 0;
@@ -768,11 +795,10 @@ function setSyncStatus(s){
 
 async function pingSupabase(){
   try{
-    const r = await fetch(SUPABASE_URL+'/rest/v1/records?select=id&limit=1',{
-      headers:{'apikey':SUPABASE_KEY,'Authorization':'Bearer '+SUPABASE_KEY},
+    const r = await fetch(API_BASE.replace('/api','')+'/health',{
       signal: AbortSignal.timeout(5000)
     });
-    if(r.ok||r.status===406){
+    if(r.ok){
       setSyncStatus('cloud');
     } else {
       setSyncStatus('offline');
@@ -812,16 +838,10 @@ function addToIndexes(r){
 }
 let DB_TOTAL_COUNT = 0;
 async function fetchTotalCount(){
-  // FIX-03: removed broken 3-arg sbFetch RPC call; use reliable count=exact header query only
+  // FIX-03: use backend API for total count
   try{
-    const r2 = await fetch(SUPABASE_URL+'/rest/v1/records?select=id&limit=1', {
-      headers:{'apikey':SUPABASE_KEY,'Authorization':'Bearer '+SUPABASE_KEY,'Prefer':'count=exact','Range':'0-0'}
-    });
-    const contentRange = r2.headers.get('content-range');
-    if(contentRange){
-      const total = parseInt(contentRange.split('/')[1]);
-      if(!isNaN(total)) DB_TOTAL_COUNT = total;
-    }
+    const r2 = await fetch(API_BASE+'/records/count');
+    if(r2.ok){ const d=await r2.json(); if(d.count) DB_TOTAL_COUNT=d.count; }
   }catch(e){}
 }
 function updateHeaderCounts(){
@@ -849,11 +869,12 @@ function showPage(page,el){
       mc.innerHTML=renderRecordsPage('All Records (loading...)',filteredDB);
       (async()=>{
         try{
-          const r = await sbFetch('/rest/v1/records?select=*&order=source_year.desc,id.desc&limit='+PAGE_SIZE+'&offset=0');
-          if(r&&r.length){
-            filteredDB = r.map((x,i)=>normalizeSupabaseRecord(x,i));
+          const r = await fetch(API_BASE+'/records/list?limit='+PAGE_SIZE+'&offset=0').then(res=>res.ok?res.json():null);
+          const rows = r?.data || [];
+          if(rows.length){
+            filteredDB = rows.map((x,i)=>normalizeSupabaseRecord(x,i));
             const existingIds = new Set(DB.map(x=>x.id));
-            r.forEach((x,i)=>{ if(!existingIds.has(x.id)){ DB.push(normalizeSupabaseRecord(x,DB.length)); addToIndexes(DB[DB.length-1]); }});
+            rows.forEach((x,i)=>{ if(!existingIds.has(x.id)){ DB.push(normalizeSupabaseRecord(x,DB.length)); addToIndexes(DB[DB.length-1]); }});
             currentPage=1;
             mc.innerHTML=renderRecordsPage('All Records',filteredDB);
           }
@@ -1032,23 +1053,15 @@ async function loadLiveDashboard(){
   try{
     // Get real counts in parallel — fast
     const [totalRes, phoneRes, emailRes] = await Promise.all([
-      fetch(SUPABASE_URL+'/rest/v1/records?select=id&limit=1',{
-        headers:{'apikey':SUPABASE_KEY,'Authorization':'Bearer '+SUPABASE_KEY,'Prefer':'count=exact','Range':'0-0'}}),
-      fetch(SUPABASE_URL+'/rest/v1/records?select=id&mobile=neq.&limit=1',{
-        headers:{'apikey':SUPABASE_KEY,'Authorization':'Bearer '+SUPABASE_KEY,'Prefer':'count=exact','Range':'0-0'}}),
-      fetch(SUPABASE_URL+'/rest/v1/records?select=id&email=neq.&limit=1',{
-        headers:{'apikey':SUPABASE_KEY,'Authorization':'Bearer '+SUPABASE_KEY,'Prefer':'count=exact','Range':'0-0'}}),
+      fetch(API_BASE+'/records/count'),
+      fetch(API_BASE+'/records/count?phone=with'),
+      fetch(API_BASE+'/records/count?email=with'),
     ]);
 
-    const getCount = r => {
-      const cr = r.headers.get('content-range');
-      if(cr){ const n=parseInt(cr.split('/')[1]); return isNaN(n)?0:n; }
-      return 0;
-    };
-
-    const total  = getCount(totalRes);
-    const phones = getCount(phoneRes);
-    const emails = getCount(emailRes);
+    const getCount = async r => r.ok ? (await r.json()).count || 0 : 0;
+    const total  = await getCount(totalRes);
+    const phones = await getCount(phoneRes);
+    const emails = await getCount(emailRes);
     if(total > 0) DB_TOTAL_COUNT = total;
 
     const set = (id,v) => { const el=document.getElementById(id); if(el) el.textContent=v; };
@@ -1118,7 +1131,7 @@ async function loadLiveDashboard(){
     const campEl = document.getElementById('live-campaigns');
     if(campEl){
       try{
-        const camps = await sbFetch('/rest/v1/campaigns?select=name,status,sent_count,reply_count&order=created_at.desc&limit=5');
+        const camps = await fetch(API_BASE+'/campaigns?limit=5').then(r=>r.ok?r.json().then(j=>j.data):null);
         if(!camps||!camps.length){
           campEl.innerHTML='<div style="color:var(--text3);font-size:12px;padding:8px 0">No campaigns yet — create your first campaign</div>';
         } else {
@@ -1205,15 +1218,21 @@ async function doSearch(){
   const fPhone  = document.getElementById('f-phone')?.value||'';
   const ql      = q.toLowerCase();
 
-  // Always query Supabase directly for full 135,888 record search
+  // Always query backend API for full record search
   if(q.length >= 2 || fCom || fBld || fYear || fPhone){
     const resEl = document.getElementById('search-results');
     if(resEl) resEl.innerHTML = '<div style="padding:20px;color:var(--text3);text-align:center">🔍 Searching '+DB_TOTAL_COUNT.toLocaleString()+' records...</div>';
 
     try{
-      // FIX-07: use PAGE_SIZE constant for consistent LIMIT across all search queries
-      let url = '/rest/v1/records?select=*&limit='+PAGE_SIZE+'&order=source_year.desc,id.desc';
+      // Build backend API query params
+      const params = new URLSearchParams({ limit: PAGE_SIZE, offset: 0 });
+      if(fCom)   params.set('community', fCom);
+      if(fBld)   params.set('building',  fBld);
+      if(fYear)  params.set('year',      fYear);
+      if(fPhone) params.set('phone',     fPhone);
 
+      // Name/mobile/permit search — still hits Supabase directly for full-text flexibility
+      let url = '/rest/v1/records?select=*&limit='+PAGE_SIZE+'&order=source_year.desc,id.desc';
       if(q.length >= 2){
         if(searchTab==='permit'){
           url += '&p_number=ilike.*'+encodeURIComponent(q.replace(/\D/g,''))+'*';
@@ -1223,19 +1242,21 @@ async function doSearch(){
         } else if(searchTab==='name'){
           url += '&name=ilike.*'+encodeURIComponent(q)+'*';
         } else {
-          // General — try name first
           url += '&name=ilike.*'+encodeURIComponent(q)+'*';
         }
+        if(fCom) url += '&area_community=eq.'+encodeURIComponent(fCom);
+        if(fBld) url += '&building=ilike.*'+encodeURIComponent(fBld)+'*';
+        if(fYear) url += '&source_year=eq.'+encodeURIComponent(fYear);
+        if(fPhone==='with') url += '&mobile=neq.';
+        if(fPhone==='without') url += '&mobile=eq.';
+        const results = await sbFetch(url);
+        filteredDB = (results||[]).map((r,i)=>normalizeSupabaseRecord(r,i));
+      } else {
+        // Filters only — use backend API
+        const res = await fetch(API_BASE+'/records/list?'+params.toString());
+        const json = res.ok ? await res.json() : null;
+        filteredDB = (json?.data||[]).map((r,i)=>normalizeSupabaseRecord(r,i));
       }
-
-      if(fCom) url += '&area_community=eq.'+encodeURIComponent(fCom);
-      if(fBld) url += '&building=ilike.*'+encodeURIComponent(fBld)+'*';
-      if(fYear) url += '&source_year=eq.'+encodeURIComponent(fYear);
-      if(fPhone==='with') url += '&mobile=neq.';
-      if(fPhone==='without') url += '&mobile=eq.';
-
-      const results = await sbFetch(url);
-      filteredDB = (results||[]).map((r,i)=>normalizeSupabaseRecord(r,i));
       currentPage = 1;
       mc.innerHTML = renderRecordsPage(
         'Search Results — '+filteredDB.length.toLocaleString()+' found'+(DB_TOTAL_COUNT>PAGE_SIZE?' (showing top '+PAGE_SIZE+')':''),
@@ -1251,9 +1272,9 @@ async function doSearch(){
   if(!q && !fCom && !fBld && !fYear && !fPhone){
     try{
       // FIX-07: consistent PAGE_SIZE limit
-      const r = await sbFetch('/rest/v1/records?select=*&order=source_year.desc,id.desc&limit='+PAGE_SIZE+'&offset=0');
-      if(r&&r.length){
-        filteredDB = r.map((x,i)=>normalizeSupabaseRecord(x,i));
+      const r = await fetch(API_BASE+'/records/list?limit='+PAGE_SIZE+'&offset=0').then(res=>res.ok?res.json():null);
+      if(r?.data?.length){
+        filteredDB = r.data.map((x,i)=>normalizeSupabaseRecord(x,i));
         currentPage = 1;
         mc.innerHTML = renderRecordsPage('All Records', filteredDB);
         return;
@@ -1527,18 +1548,9 @@ async function loadSbInvestors(forceReload=false){
   setSyncStatus('syncing');
 
     while(true){
-      // Use explicit Range header — Supabase free tier silently caps at 1000 without it
-      const res = await fetch(SUPABASE_URL+
-        `/rest/v1/records?select=name,mobile,secondary_mobile,email,building,area_community,unit_number,source_year,p_number&order=id&offset=${offset}&limit=${PAGE}`,
-        { headers:{
-            'apikey': SUPABASE_KEY,
-            'Authorization': 'Bearer '+SUPABASE_KEY,
-            'Range': `${offset}-${offset+PAGE-1}`,
-            'Range-Unit': 'items'
-          }
-        }
-      );
-      const batch = res.ok ? await res.json() : [];
+      const res = await fetch(API_BASE+`/records/list?limit=${PAGE}&offset=${offset}`);
+      const json = res.ok ? await res.json() : {};
+      const batch = json.data || [];
       if(!batch || !batch.length) break;
 
       for(const r of batch){
@@ -1716,7 +1728,8 @@ async function showSbOwnerModal(encodedName){
   if(ownerIndex.has(name)){ showOwnerModal(encodedName); return; }
   // Load from Supabase
   try{
-    const records = await sbFetch('/rest/v1/records?select=*&name=eq.'+encodeURIComponent(name)+'&limit=50');
+    const res = await fetch(API_BASE+'/records/by-name?name='+encodeURIComponent(name));
+    const records = res.ok ? (await res.json()).data : null;
     if(records && records.length){
       const normed = records.map((r,i)=>normalizeSupabaseRecord(r,i));
       // Temporarily add to indexes for modal
@@ -1746,7 +1759,8 @@ async function loadLeadsFromSb(force=false){
   const sub = document.getElementById('leads-sub');
   try{
     if(sub) sub.textContent = 'Loading from Supabase...';
-    const r = await sbFetch('/rest/v1/records?select=*&record_type=eq.Lead&order=source_year.desc,id.desc&limit=2000');
+    const res = await fetch(API_BASE+'/records/list?record_type=Lead&limit=2000&offset=0');
+    const r = res.ok ? (await res.json()).data : null;
     _sbLeads = (r||[]).map((x,i)=>normalizeSupabaseRecord(x,i));
     // Populate community dropdown
     const comms = [...new Set(_sbLeads.map(r=>r.area_community).filter(Boolean))].sort();
@@ -2180,9 +2194,9 @@ async function handleCleanUploadNew(fileList) {
     const finalRecords = corrected;
     // ─────────────────────────────────────────────────────────────
 
-    addLog('Uploading to Supabase...', 'var(--blue)');
+    addLog('Uploading to backend API...', 'var(--blue)');
 
-    const BATCH = 250;
+    const BATCH = 100;
     let uploaded = 0;
     let errors = 0;
 
@@ -2194,17 +2208,12 @@ async function handleCleanUploadNew(fileList) {
       statusEl.textContent = 'Uploading ' + i.toLocaleString() + ' / ' + clean.length.toLocaleString() + '...';
 
       try {
-        const resp = await fetch(SUPABASE_URL + '/rest/v1/records', {
+        const resp = await fetch(API_BASE + '/records/upload', {
           method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'apikey': SUPABASE_KEY,
-            'Authorization': 'Bearer ' + SUPABASE_KEY,
-            'Prefer': 'resolution=ignore-duplicates'
-          },
-          body: JSON.stringify(batch)
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ rows: batch })
         });
-        if (resp.ok || resp.status === 201) {
+        if (resp.ok) {
           uploaded += batch.length;
           if (i % 5000 === 0 && i > 0) addLog('↑ ' + uploaded.toLocaleString() + ' uploaded...', 'var(--blue)');
         } else {
@@ -2331,7 +2340,7 @@ async function handleCleanUpload(fileList) {
     // ─────────────────────────────────────────────────────────────
 
     // Upload in batches
-    const BATCH = 250;
+    const BATCH = 100;
     let uploaded = 0;
     let errors = 0;
 
@@ -2343,15 +2352,10 @@ async function handleCleanUpload(fileList) {
       status.textContent = `Uploading ${i.toLocaleString()} / ${clean.length.toLocaleString()}...`;
 
       try {
-        const resp = await fetch(SUPABASE_URL+'/rest/v1/'+TARGET_TABLE, {
+        const resp = await fetch(API_BASE+'/records/upload', {
           method:'POST',
-          headers:{
-            'Content-Type':'application/json',
-            'apikey':SUPABASE_KEY,
-            'Authorization':'Bearer '+SUPABASE_KEY,
-            'Prefer':'resolution=merge-duplicates'
-          },
-          body: JSON.stringify(batch)
+          headers:{ 'Content-Type':'application/json' },
+          body: JSON.stringify({ rows: batch })
         });
         if (resp.ok) {
           uploaded += batch.length;
@@ -2385,8 +2389,37 @@ function initUpload(){
   const zone=document.getElementById('upload-zone');
   if(!zone)return;
 }
-function handleFileUpload(fileList){const files=[...fileList].filter(f=>f.name.endsWith('.xlsx')||f.name.endsWith('.xls'));if(!files.length)return;fileQueue=[...fileQueue,...files.map(f=>({file:f,status:'pending',added:0,skipped:0,aiMapped:false,err:''}))];if(!isProcessing)processQueue();}
-async function processQueue(){isProcessing=true;for(const item of fileQueue){if(item.status!=='pending')continue;item.status='processing';try{await processOneFile(item);item.status='done';}catch(e){item.status='error';item.err=e.message;}}isProcessing=false;rebuildIndexes();updateHeaderCounts();}
+function handleFileUpload(fileList){
+  const files=[...fileList].filter(f=>f.name.endsWith('.xlsx')||f.name.endsWith('.xls'));
+  if(!files.length)return;
+  fileQueue=[...fileQueue,...files.map(f=>({file:f,status:'pending',added:0,skipped:0,aiMapped:false,err:''}))];
+  if(!isProcessing)processQueue();
+}
+async function processQueue(){
+  isProcessing=true;
+  for(const item of fileQueue){
+    if(item.status!=='pending')continue;
+    item.status='processing';
+    try{
+      await processOneFile(item);
+      item.status='done';
+      if(item.added > 0){
+        showToast(`✅ "${item.file.name}" uploaded — ${item.added} records saved${item.skipped>0?' ('+item.skipped+' duplicates skipped)':''}`, 'success');
+      } else if(item.skipped > 0){
+        showToast(`⚠️ "${item.file.name}" — 0 new records. All ${item.skipped} rows already exist (duplicates).`, 'error');
+      } else {
+        showToast(`⚠️ "${item.file.name}" — No valid records found. Check column headers match: Owner Name, Phone 1, Building, Community.`, 'error');
+      }
+    }catch(e){
+      item.status='error';
+      item.err=e.message;
+      showToast(`❌ "${item.file.name}" upload failed: ${e.message}`, 'error');
+    }
+  }
+  isProcessing=false;
+  rebuildIndexes();
+  updateHeaderCounts();
+}
 async function getAIMapping(headers,sampleRows){const cacheKey=headers.map(h=>h.toLowerCase().trim()).join(',');if(aiMappingCache.has(cacheKey))return aiMappingCache.get(cacheKey);const ruleMap=ruleBasedMapping(headers);const hasName=!!(ruleMap.name);const hasPhone=!!(ruleMap.mobile);if(hasName&&hasPhone){aiMappingCache.set(cacheKey,{mapping:ruleMap,usedAI:false});return{mapping:ruleMap,usedAI:false};}try{const prompt=`Map these Dubai real estate Excel headers to fields. Headers: ${JSON.stringify(headers)} Respond ONLY with JSON: {"HEADER":"field_or_null",...}`;const resp=await fetch(CF_WORKER,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({model:'claude-sonnet-4-20250514',max_tokens:800,messages:[{role:'user',content:prompt}]})});const data=await resp.json();const text=data.content?.[0]?.text||'{}';const aiMap=JSON.parse(text.replace(/```json|```/g,'').trim());const merged={...ruleMap};for(const[col,field]of Object.entries(aiMap)){if(field&&!merged[field])merged[field]=col;}aiMappingCache.set(cacheKey,{mapping:merged,usedAI:true});return{mapping:merged,usedAI:true};}catch(e){aiMappingCache.set(cacheKey,{mapping:ruleMap,usedAI:false});return{mapping:ruleMap,usedAI:false};}}
 function ruleBasedMapping(headers){const find=(aliases)=>{for(const a of aliases){const h=headers.find(h=>{const hl=h.toLowerCase().trim();return hl===a||(a.length>4&&hl.includes(a));});if(h)return h;}return null;};return{name:find(['owner name','buyer name','client name','owner_name','ownername','full name','proprietor name','proprietor','customer name','resident name','investor name','registered party','name']),mobile:find(['primary mobile','primary phone','contact number','mobile number','phone number','contact no','telephone','mob no','gsm','cell','whatsapp','handphone','mobile','phone']),secondary_mobile:find(['secondary mobile','secondary_mobile','secondary phone','phone2','mobile2','alt mobile','second mobile','mobile 2','alternate mobile','other mobile','other phone']),phone3:find(['phone3','mobile3','third mobile','third phone','tertiary mobile']),email:find(['email address','email id','e-mail address','e-mail','e_mail','electronic mail','email']),email2:find(['email2','secondary email','alt email','other email','email 2']),building:find(['building name','building_name','tower name','buidling/project','building/project','development name','compound name','block name','tower','building','development','compound','block']),unit_number:find(['unit number','unit_number','flat number','flat_number','flat no','villa no.','villa no','villa number','registration number','property number','apartment no','apartment number','suite number','suite no','property','apartment','flat','unti number']),floor:find(['floor number','floor no','floor level','level number','storey','floor']),rooms:find(['rooms description','bedroom type','unit type','room type','no of bedrooms','number of bedrooms','beds','bedrooms','rooms','configuration','usage','type']),actual_area:find(['actual area','actual_area','builtup_area','built_up_area','net area','total area','built up area','bua','size','area sqft','area sqm']),area_community:find(['master community','master project','master_project','community name','area name','district name','location name','emirate','sub community','community','district','zone','area','locality','location']),p_number:find(['p-number','p_number','p number','permit number','permit no','municipality number','dld number','title deed number','cadastral number','permit ref','ref code','permit','municipality','title deed','cadastral']),project:find(['project name','development name','project','development']),parking:find(['parking number','parking no','parking_number','car parking','parking space','parking']),plot:find(['plot number','plot no','plot'])};}
 const BUILDING_INFER_MAP={'burj crown':{community:'Downtown Dubai'},'burj royale':{community:'Downtown Dubai'},'address downtown':{community:'Downtown Dubai'},'bellevue towers':{community:'Business Bay / Downtown Dubai'},'boulevard plaza':{community:'Downtown Dubai'},'downtown views':{community:'Downtown Dubai'},'burj lake hotel':{community:'Downtown Dubai'},'dubai mall residences':{community:'Downtown Dubai'},'parklane views':{community:'Dubai South'},'voi residence':{community:'Dubai South'},'cresswell residences':{community:'Dubai South'},'parkside':{community:'Dubai South'},'pulse villas':{community:'Dubai South'},'celestia':{community:'Dubai South'},'tenora':{community:'Dubai South'},'emaar oasis':{community:'Emaar Oasis'},'the valley':{community:'The Valley'}};
@@ -2394,7 +2427,47 @@ function inferFromName(name){if(!name)return{};const low=name.toLowerCase().repl
 function titleCase(s){return s.replace(/\w\S*/g,t=>t.charAt(0).toUpperCase()+t.slice(1));}
 // FIX-06: sheetRows removed (was 0 = no limit, caused freeze). Parse is now done once;
 // getSheetRows reuses the wb object instead of re-reading the ArrayBuffer.
-async function processOneFile(item){const file=item.file;const ab=await file.arrayBuffer();const wb=XLSX.read(ab,{type:'array',dense:true});let added=0,skipped=0;const newRecords=[];for(const sname of wb.SheetNames){const rows=getSheetRows(wb,sname);if(!rows||rows.length<2)continue;if(rows.length>20000){showToast('Large file: '+file.name+' ('+rows.length.toLocaleString()+' rows) — processing, please wait…','');}const{headerIdx,headers}=detectHeader(rows);if(headerIdx===-1)continue;const{mapping}=await getAIMapping(headers,rows.slice(headerIdx+1,headerIdx+6).map(r=>Object.fromEntries(headers.map((h,i)=>[h,r&&r[i]!==null&&r[i]!==undefined?String(r[i]).trim():'']))));const dataRows=rows.slice(headerIdx+1);for(const row of dataRows){if(!row)continue;const gr=(field)=>{const col=mapping[field];if(!col)return'';const idx=headers.findIndex(h=>h===col);if(idx<0||!row||idx>=row.length)return'';return cs(row[idx]);};const name=gr('name');if(!name||name.length<3)continue;const pnum=gr('p_number');if(pnum&&name&&pnumIndex.has(pnum+'|'+name.toUpperCase())){skipped++;continue;}const v1=validatePhone(String(row[headers.findIndex(h=>h===mapping.mobile)]||''));const mobile=v1.isValid?v1.normalized:'';const rec={id:DB.length+newRecords.length,name,mobile,secondary_mobile:'',phone3:'',email:gr('email'),email2:'',building:gr('building')||inferFromName(sname).building||'',unit_number:gr('unit_number'),floor:gr('floor'),rooms:gr('rooms'),actual_area:gr('actual_area'),area_community:gr('area_community')||inferFromName(sname).community||'',p_number:pnum,project:gr('project'),parking:gr('parking'),record_type:'Owner',lead_type:'',notes:'',source_file:file.name,source_year:new Date().getFullYear()};newRecords.push(rec);added++;if(pnum&&name)pnumIndex.set(pnum+'|'+name.toUpperCase(),rec);}}if(newRecords.length){DB.push(...newRecords);await saveToSupabase(newRecords);}item.added=added;item.skipped=skipped;}
+async function processOneFile(item){
+  const file=item.file;
+  const ab=await file.arrayBuffer();
+  const wb=XLSX.read(ab,{type:'array',dense:true});
+  let added=0,skipped=0;
+  const newRecords=[];
+  const sessionPnumSet=new Set();
+  for(const sname of wb.SheetNames){
+    const rows=getSheetRows(wb,sname);
+    if(!rows||rows.length<2)continue;
+    if(rows.length>20000){showToast('Large file: '+file.name+' ('+rows.length.toLocaleString()+' rows) — processing, please wait…','');}
+    const{headerIdx,headers}=detectHeader(rows);
+    if(headerIdx===-1)continue;
+    const{mapping}=await getAIMapping(headers,rows.slice(headerIdx+1,headerIdx+6).map(r=>Object.fromEntries(headers.map((h,i)=>[h,r&&r[i]!==null&&r[i]!==undefined?String(r[i]).trim():'']))));
+    const dataRows=rows.slice(headerIdx+1);
+    for(const row of dataRows){
+      if(!row)continue;
+      const gr=(field)=>{const col=mapping[field];if(!col)return'';const idx=headers.findIndex(h=>h===col);if(idx<0||!row||idx>=row.length)return'';return cs(row[idx]);};
+      const name=gr('name');
+      if(!name||name.length<3)continue;
+      const pnum=gr('p_number');
+      // Only skip duplicates within this upload session — not against DB index
+      if(pnum&&name&&sessionPnumSet.has(pnum+'|'+name.toUpperCase())){
+        skipped++;
+        continue;
+      }
+      const v1=validatePhone(String(row[headers.findIndex(h=>h===mapping.mobile)]||''));
+      const mobile=v1.isValid?v1.normalized:'';
+      const rec={id:DB.length+newRecords.length,name,mobile,secondary_mobile:'',phone3:'',email:gr('email'),email2:'',building:gr('building')||inferFromName(sname).building||'',unit_number:gr('unit_number'),floor:gr('floor'),rooms:gr('rooms'),actual_area:gr('actual_area'),area_community:gr('area_community')||inferFromName(sname).community||'',p_number:pnum,project:gr('project'),parking:gr('parking'),record_type:'Owner',lead_type:'',notes:'',source_file:file.name,source_year:new Date().getFullYear()};
+      newRecords.push(rec);
+      added++;
+      if(pnum&&name)sessionPnumSet.add(pnum+'|'+name.toUpperCase());
+    }
+  }
+  if(newRecords.length){
+    DB.push(...newRecords);
+    await saveToSupabase(newRecords);
+  }
+  item.added=added;
+  item.skipped=skipped;
+}
 // FIX-06: getSheetRows now uses the already-parsed wb object instead of re-reading ab,
 // eliminating the double-parse. Empty rows are filtered before returning.
 function getSheetRows(wb,sname){
@@ -2610,16 +2683,15 @@ async function runDataAudit(){
   el.innerHTML = '<div style="color:var(--text3);padding:12px">⏳ Running audit...</div>';
   try{
     const [totalRes, phoneRes, emailRes, ownerRes, leadRes, blankCommRes] = await Promise.all([
-      fetch(SUPABASE_URL+'/rest/v1/records?select=id&limit=1',{headers:{'apikey':SUPABASE_KEY,'Authorization':'Bearer '+SUPABASE_KEY,'Prefer':'count=exact','Range':'0-0'}}),
-      fetch(SUPABASE_URL+'/rest/v1/records?select=id&mobile=neq.&mobile=not.like.INVALID*&limit=1',{headers:{'apikey':SUPABASE_KEY,'Authorization':'Bearer '+SUPABASE_KEY,'Prefer':'count=exact','Range':'0-0'}}),
-      fetch(SUPABASE_URL+'/rest/v1/records?select=id&email=neq.&limit=1',{headers:{'apikey':SUPABASE_KEY,'Authorization':'Bearer '+SUPABASE_KEY,'Prefer':'count=exact','Range':'0-0'}}),
-      fetch(SUPABASE_URL+'/rest/v1/records?select=id&record_type=eq.Owner&limit=1',{headers:{'apikey':SUPABASE_KEY,'Authorization':'Bearer '+SUPABASE_KEY,'Prefer':'count=exact','Range':'0-0'}}),
-      fetch(SUPABASE_URL+'/rest/v1/records?select=id&record_type=eq.Lead&limit=1',{headers:{'apikey':SUPABASE_KEY,'Authorization':'Bearer '+SUPABASE_KEY,'Prefer':'count=exact','Range':'0-0'}}),
-      fetch(SUPABASE_URL+'/rest/v1/records?select=id&area_community=eq.&limit=1',{headers:{'apikey':SUPABASE_KEY,'Authorization':'Bearer '+SUPABASE_KEY,'Prefer':'count=exact','Range':'0-0'}}),
+      fetch(API_BASE+'/records/count').then(r=>r.json()),
+      fetch(API_BASE+'/records/count?phone=with').then(r=>r.json()),
+      fetch(API_BASE+'/records/count?email=with').then(r=>r.json()),
+      fetch(API_BASE+'/records/count?record_type=Owner').then(r=>r.json()),
+      fetch(API_BASE+'/records/count?record_type=Lead').then(r=>r.json()),
+      fetch(API_BASE+'/records/count?community=__blank__').then(r=>r.json()),
     ]);
-    const getCount = r=>{const cr=r.headers.get('content-range');if(cr){const n=parseInt(cr.split('/')[1]);return isNaN(n)?0:n;}return 0;};
-    const total=getCount(totalRes), phones=getCount(phoneRes), emails=getCount(emailRes);
-    const owners=getCount(ownerRes), leads=getCount(leadRes), blankComm=getCount(blankCommRes);
+    const total=totalRes.count||0, phones=phoneRes.count||0, emails=emailRes.count||0;
+    const owners=ownerRes.count||0, leads=leadRes.count||0, blankComm=blankCommRes.count||0;
     const phonePct = total>0?Math.round(phones/total*100):0;
     const emailPct = total>0?Math.round(emails/total*100):0;
 
@@ -3114,9 +3186,9 @@ async function loadHistoryFromSb(force=false){
     const unitMap = new Map();
     let offset=0, total=0;
     while(true){
-      const _hr = await fetch(SUPABASE_URL+`/rest/v1/records?select=name,mobile,building,unit_number,area_community,rooms,p_number,source_year,source_file&order=id&offset=${offset}&limit=1000`,
-        {headers:{'apikey':SUPABASE_KEY,'Authorization':'Bearer '+SUPABASE_KEY,'Range':`${offset}-${offset+999}`,'Range-Unit':'items'}});
-      const batch = _hr.ok ? await _hr.json() : [];
+      const res = await fetch(API_BASE+`/records/list?limit=1000&offset=${offset}&select=name,mobile,building,unit_number,area_community,rooms,p_number,source_year,source_file`);
+      const json = res.ok ? await res.json() : {};
+      const batch = json.data || [];
       if(!batch||!batch.length) break;
       for(const r of batch){
         const pnum=(r.p_number||'').trim();
@@ -3196,9 +3268,9 @@ async function runDupPhoneAnalysis(){
     let total = 0;
 
     while(true){
-      const _dr = await fetch(SUPABASE_URL+`/rest/v1/records?select=name,mobile,secondary_mobile,building,area_community&mobile=neq.&order=id&offset=${offset}&limit=1000`,
-        {headers:{'apikey':SUPABASE_KEY,'Authorization':'Bearer '+SUPABASE_KEY,'Range':`${offset}-${offset+999}`,'Range-Unit':'items'}});
-      const batch = _dr.ok ? await _dr.json() : [];
+      const res = await fetch(API_BASE+`/records/list?limit=1000&offset=${offset}&phone=with`);
+      const json = res.ok ? await res.json() : {};
+      const batch = json.data || [];
       if(!batch||!batch.length) break;
 
       for(const r of batch){
@@ -6722,50 +6794,31 @@ function metaNormalizePhone(raw){
 }
 
 async function metaSendTemplate(phone, templateName, languageCode='en', components=[], ownerData={}){
-  const token = metaGetToken();
-  const phoneId = metaGetPhoneId();
-  if(!token || !phoneId) throw new Error('Meta credentials not configured — go to WA Campaign Center and add token');
-  const normalized = metaNormalizePhone(phone);
-  if(!normalized) throw new Error('Invalid phone: '+phone);
-
-  const payload = {
-    messaging_product:'whatsapp',
-    to: normalized,
-    type:'template',
-    template:{
-      name: templateName,
-      language:{ code: languageCode }
-    }
-  };
-
-  // Only add components if explicitly passed (for templates with variables)
-  if(components && components.length > 0){
-    payload.template.components = components;
-  }
-
-  const r = await fetch(`https://graph.facebook.com/v22.0/${phoneId}/messages`,{
-    method:'POST',
-    headers:{'Authorization':'Bearer '+token,'Content-Type':'application/json'},
-    body: JSON.stringify(payload)
+  const res = await fetch(API_BASE+'/whatsapp/send-template', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ phone, templateName, languageCode, components, ownerName: ownerData?.name||'' }),
   });
-  const d = await r.json();
-  if(d.messages?.[0]?.id) return { success:true, wamid:d.messages[0].id };
-  throw new Error(d.error?.message || JSON.stringify(d));
+  const d = await res.json();
+  if (!res.ok) throw new Error(d.error || 'WhatsApp send failed');
+  return { success: true, wamid: d.wamid };
 }
 
 async function metaLogOutreach(phone, ownerName, templateName, wamid, status='sent'){
-  try {
-    await sbFetch('/rest/v1/outreach_log',{method:'POST',prefer:'return=minimal',body:JSON.stringify({
-      phone, owner_name:ownerName, channel:'whatsapp',
-      message_body:'[Template: '+templateName+']',
-      status, wamid, direction:'outbound',
-      created_at: new Date().toISOString()
-    })});
-  } catch(e){ /* silent — don't let logging break campaign */ }
+  // Logging is now handled server-side in /api/whatsapp/send-template
 }
 
-// FIX-08: Legacy WhatsJet functions removed. wjSendTemplate shim kept for call-site compatibility.
-async function wjSendMessage(phone, message){ throw new Error('Free-text messages not allowed by Meta. Use templates via WA Campaign Center.'); }
+// WhatsApp send functions — all proxied via backend /api/whatsapp
+async function wjSendMessage(phone, message, ownerName=''){
+  const res = await fetch(API_BASE+'/whatsapp/send-message', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ phone, message, ownerName }),
+  });
+  const d = await res.json();
+  if (!res.ok) throw new Error(d.error || 'WhatsApp send failed');
+  return { success: true, wamid: d.wamid };
+}
 async function wjSendTemplate(phone, templateName, languageCode='en', components=[]){
   return await metaSendTemplate(phone, templateName, languageCode, components);
 }
@@ -7055,16 +7108,32 @@ async function wjLaunchCampaign(contacts){
   addLog(`Campaign: ${name} | Template: ${templateName} | ${contacts.length} recipients`, '#C9A96E');
   addLog(`Sending via Meta Cloud API (+971 54 273 2522) — 1.2s delay between messages`, '#8696a0');
 
-  // Save campaign to Supabase
+  // Queue campaign via backend BullMQ
   try {
-    await sbFetch('/rest/v1/campaigns',{method:'POST',prefer:'return=minimal',body:JSON.stringify({
-      name: name||'WhatsApp Campaign',
-      channel:'whatsapp', status:'running',
-      total_recipients: contacts.length,
-      audience_community: contacts[0]?.community||'',
-      custom_message:'[Template: '+templateName+']',
-    })});
-  } catch(e){ /* continue */ }
+    const qRes = await fetch(API_BASE+'/campaigns/launch', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        campaignName: name||'WhatsApp Campaign',
+        templateName,
+        languageCode: templateLang,
+        contacts: contacts.map(c=>({ name:c.name, mobile:c.mobile, community:c.community })),
+      }),
+    });
+    const qData = await qRes.json();
+    if(qRes.ok){
+      addLog(`✅ Campaign queued — Job ID: ${qData.jobId} | ${qData.queued} contacts`, '#5ABF8E');
+      if(statusEl) statusEl.textContent = `✅ Queued — ${qData.queued} messages being sent in background`;
+      if(barEl) barEl.style.width = '100%';
+      btn.textContent = '✅ Queued!';
+      showToast(`Campaign queued: ${qData.queued} contacts ✓`, 'success');
+      window._campStop = false;
+      return;
+    }
+    addLog(`⚠ Queue failed: ${qData.error} — falling back to direct send`, '#f59e0b');
+  } catch(e) {
+    addLog(`⚠ Backend unavailable — sending directly`, '#f59e0b');
+  }
 
   for(let i=0; i<contacts.length; i++){
     if(window._campStop){ addLog('⏹ Stopped by user at '+i+'/'+contacts.length,'#E05A5A'); break; }
@@ -7098,13 +7167,7 @@ async function wjLaunchCampaign(contacts){
   btn.textContent = '✅ Done!';
   showToast(`Campaign complete: ${sent} sent ✓`, 'success');
 
-  // Update campaign stats in Supabase
-  try {
-    await sbFetch('/rest/v1/campaigns?name=eq.'+encodeURIComponent(name||'WhatsApp Campaign'),{method:'PATCH',prefer:'return=minimal',body:JSON.stringify({
-      status:'completed', sent_count:sent
-    })});
-  } catch(e){ /* silent */ }
-
+  // Campaign stats updated by backend worker
   window._campStop = false;
 }
 
@@ -7517,8 +7580,9 @@ async function loadOwnerTimeline(){
   let records = ownerIndex.get(name) || DB.filter(r=>r.name.toLowerCase()===name.toLowerCase());
   if(!records.length){
     try{
-      const r = await sbFetch('/rest/v1/records?select=*&name=ilike.'+encodeURIComponent(name)+'&order=source_year.asc,id.asc&limit=200');
-      records = (r||[]).map((x,i)=>normalizeSupabaseRecord(x,i));
+      const r2 = await fetch(API_BASE+'/records/by-name?name='+encodeURIComponent(name));
+      records = r2.ok ? (await r2.json()).data||[] : [];
+      records = records.map((x,i)=>normalizeSupabaseRecord(x,i));
     }catch(e){ el.innerHTML=`<div style="color:var(--red);padding:20px">Error: ${e.message}</div>`; return; }
   }
   if(!records.length){ el.innerHTML=`<div class="empty-state"><div class="empty-icon">🔍</div><div class="empty-title">No records found for "${name}"</div></div>`; return; }
@@ -9522,6 +9586,17 @@ function renderWACompose(){
 }
 
 // ── New unified WA audience targeting ─────────────────────
+// Convert Supabase-style filter string to backend API query params
+function waFilterToParams(filter){
+  const p = new URLSearchParams();
+  p.set('phone','with');
+  const bMatch = filter.match(/building=ilike\.\*([^&*]+)\*/);
+  const cMatch = filter.match(/area_community=ilike\.\*([^&*]+)\*/);
+  if(bMatch) p.set('building', decodeURIComponent(bMatch[1]));
+  if(cMatch) p.set('community', decodeURIComponent(cMatch[1]));
+  return p.toString();
+}
+
 let _waSearchTimer;
 function debounceWASearch(){ clearTimeout(_waSearchTimer); _waSearchTimer = setTimeout(updateWALaunchSummary, 600); }
 
@@ -9551,11 +9626,10 @@ async function updateWALaunchSummary(){
   if(type==='search'){ const b=document.getElementById('wps-building')?.value?.trim(); const c=document.getElementById('wps-community')?.value?.trim(); if(b) filter+=`&building=ilike.*${encodeURIComponent(b)}*`; if(c) filter+=`&area_community=ilike.*${encodeURIComponent(c)}*`; }
 
   try {
-    const key = window.SUPABASE_KEY || localStorage.getItem('ck_supa_key') || '';
-    const r = await fetch(`${window.SUPABASE_URL||window.CK_SUPABASE_URL||''}/rest/v1/records?select=id${filter}&not.mobile.is.null&mobile.neq.`, {
-      headers:{'apikey':key,'Authorization':'Bearer '+key,'Prefer':'count=exact','Range':'0-0'}
-    });
-    const total = parseInt(r.headers.get('content-range')?.split('/')[1]||'0');
+    const params = waFilterToParams(filter);
+    const r = await fetch(`${API_BASE}/records/count?${params}`);
+    const json = await r.json();
+    const total = json.count || 0;
     const send = Math.min(total, max);
     const mins = Math.ceil(send * 1.2 / 60);
     if(summary) summary.innerHTML = `
@@ -9591,10 +9665,10 @@ async function runWAPrecisionSearch(){
   if(countEl) countEl.innerHTML='<span style="color:var(--gold)">⏳ Searching...</span>';
 
   try{
-    const r = await fetch(`${SUPABASE_URL}/rest/v1/records?select=id${filter}&not.mobile.is.null&mobile.neq.`,{
-      headers:{'apikey':SUPABASE_KEY,'Authorization':'Bearer '+SUPABASE_KEY,'Prefer':'count=exact','Range':'0-0'}
-    });
-    const total = parseInt(r.headers.get('content-range')?.split('/')[1]||'0');
+    const params = waFilterToParams(filter);
+    const r = await fetch(`${API_BASE}/records/count?${params}`);
+    const json = await r.json();
+    const total = json.count || 0;
     if(countEl) countEl.innerHTML=`<span style="color:var(--green)">✅ ${total.toLocaleString()} owners found with valid phones</span>`;
     window._waAudienceCount = total;
     updateWALaunchSummaryDirect(total, filter);
@@ -9612,10 +9686,10 @@ async function updateWALaunchSummary(){
   if(type==='search'){ filter = window._waAudienceFilter||''; }
   window._waAudienceFilter = filter;
   try{
-    const r = await fetch(`${SUPABASE_URL}/rest/v1/records?select=id${filter}&not.mobile.is.null&mobile.neq.`,{
-      headers:{'apikey':SUPABASE_KEY,'Authorization':'Bearer '+SUPABASE_KEY,'Prefer':'count=exact','Range':'0-0'}
-    });
-    const total = parseInt(r.headers.get('content-range')?.split('/')[1]||'0');
+    const params = waFilterToParams(filter);
+    const r = await fetch(`${API_BASE}/records/count?${params}`);
+    const json = await r.json();
+    const total = json.count || 0;
     updateWALaunchSummaryDirect(total, filter);
   }catch(e){ /* silent */ }
 }
@@ -9657,16 +9731,14 @@ async function launchNewWACampaign(){
   if(!template){ showToast('Select a template first','error'); return; }
   if(!metaGetToken()){ showToast('Meta token not configured','error'); return; }
 
-  // Load contacts from Supabase
+  // Load contacts via backend
   showToast('Loading recipients...','');
-  const key = window.SUPABASE_KEY || localStorage.getItem('ck_supa_key') || '';
   let contacts = [];
   try {
-    const r = await fetch(`${SUPABASE_URL}/rest/v1/records?select=name,mobile,building,area_community${filter}&not.mobile.is.null&mobile.neq.&limit=${max}`,{
-      headers:{'apikey':SUPABASE_KEY,'Authorization':'Bearer '+SUPABASE_KEY}
-    });
-    const data = await r.json();
-    contacts = (data||[]).filter(x=>x.mobile&&x.mobile.length>5);
+    const params = waFilterToParams(filter);
+    const r = await fetch(`${API_BASE}/records/list?limit=${max}&${params}`);
+    const json = await r.json();
+    contacts = (json.data||[]).filter(x=>x.mobile&&x.mobile.length>5);
   } catch(e){ showToast('Failed to load contacts: '+e.message,'error'); return; }
 
   if(!contacts.length){ showToast('No contacts found','error'); return; }
@@ -10122,7 +10194,7 @@ async function launchWACampaign(){
     // Pull from Supabase for full count
     showToast('Loading community contacts...','');
     try{
-      const r = await sbFetch('/rest/v1/records?select=name,mobile,building,area_community&area_community=ilike.*'+encodeURIComponent(comm)+'*&mobile=neq.&limit=1000');
+      const r = await fetch(API_BASE+'/records/list?community='+encodeURIComponent(comm)+'&phone=with&limit=1000&offset=0').then(res=>res.ok?res.json().then(j=>j.data):null);
       contacts=(r||[]).filter(x=>x.mobile&&!x.mobile.startsWith('INVALID')).map(x=>({name:x.name,mobile:x.mobile,building:x.building||'',community:x.area_community||''}));
       // Deduplicate
       const seen=new Set(); contacts=contacts.filter(x=>{const k=x.name+'|'+x.mobile;if(seen.has(k))return false;seen.add(k);return true;});
@@ -10133,7 +10205,7 @@ async function launchWACampaign(){
     // Pull from Supabase
     showToast('Loading building contacts...','');
     try{
-      const r = await sbFetch('/rest/v1/records?select=name,mobile,building,area_community&building=ilike.*'+encodeURIComponent(bldg)+'*&mobile=neq.&limit=500');
+      const r = await fetch(API_BASE+'/records/list?building='+encodeURIComponent(bldg)+'&phone=with&limit=500&offset=0').then(res=>res.ok?res.json().then(j=>j.data):null);
       contacts=(r||[]).filter(x=>x.mobile&&!x.mobile.startsWith('INVALID')).map(x=>({name:x.name,mobile:x.mobile,building:x.building||bldg,community:x.area_community||''}));
       const seen=new Set(); contacts=contacts.filter(x=>{const k=x.name+'|'+x.mobile;if(seen.has(k))return false;seen.add(k);return true;});
     }catch(e){showToast('Error loading: '+e.message,'error');return;}
@@ -10151,7 +10223,7 @@ async function loadWACampaignHistory(){
   const el=document.getElementById('wa-tab-campaigns');
   if(!el)return;
   try{
-    const camps=await sbFetch('/rest/v1/campaigns?select=*&order=created_at.desc&limit=20').catch(()=>[]);
+    const camps=await fetch(API_BASE+'/campaigns?limit=20').then(r=>r.ok?r.json().then(j=>j.data):null).catch(()=>null);
     if(!camps||!camps.length){
       el.innerHTML=`<div class="empty-state"><div class="empty-icon">📊</div><div class="empty-title">No campaigns yet</div><div style="font-size:13px;color:var(--text3);margin-top:8px">Launch your first campaign from the Compose tab</div></div>`;
       return;
