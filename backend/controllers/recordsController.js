@@ -64,6 +64,8 @@ async function uploadRecords(req, res, next) {
         'phone 2':'secondary_mobile','unit number':'unit_number',
         'community':'area_community','p-number':'p_number',
         'source year':'source_year','year':'source_year',
+        'record type':'record_type','type':'record_type','category':'record_type',
+        'lead type':'record_type','owner type':'record_type',
       };
       const VALID = ['name','mobile','secondary_mobile','email','building','unit_number',
                      'area_community','p_number','source_year','rooms','record_type','flag','source_file'];
@@ -75,7 +77,7 @@ async function uploadRecords(req, res, next) {
           if (VALID.includes(key)) r[key] = String(v || '').trim();
         }
         if (!r.record_type) r.record_type = 'Owner';
-        if (!r.source_year) r.source_year = new Date().getFullYear();
+        if (!r.source_year || r.source_year === '0') r.source_year = new Date().getFullYear();
         if (!r.source_file) r.source_file = req.file.originalname;
         return r;
       }).filter(r => r.name && r.name.length > 1);
