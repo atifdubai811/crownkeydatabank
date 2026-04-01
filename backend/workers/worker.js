@@ -13,7 +13,9 @@ const worker = new Worker('campaign', async (job) => {
   for (let i = 0; i < contacts.length; i++) {
     const rec = contacts[i];
     try {
-      const result = await sendTemplate(rec.mobile, templateName, languageCode || 'en');
+      console.log('rec', JSON.stringify(rec))
+      console.log(`[worker] Sending template="${templateName}" lang="${languageCode || 'en_US'}" to=${rec.mobile}`);
+      const result = await sendTemplate(rec.mobile, templateName, languageCode || 'en_US', [{ name: rec.name || ' ', community: rec.community || '' }]);
 
       // Log to outreach_log
       await sbFetch('/rest/v1/outreach_log', {
@@ -23,7 +25,7 @@ const worker = new Worker('campaign', async (job) => {
           phone: result.to,
           owner_name: rec.name || '',
           channel: 'whatsapp',
-          message_body: `[Template: ${templateName}]`,
+          message_body: result.bodyText || `[Template: ${templateName}]`,
           status: 'sent',
           wamid: result.wamid,
           direction: 'outbound',

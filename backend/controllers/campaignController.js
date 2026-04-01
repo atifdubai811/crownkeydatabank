@@ -31,7 +31,7 @@ async function launchCampaign(req, res, next) {
 
     // Enqueue job
     const job = await campaignQueue.add('send', {
-      contacts, templateName, languageCode: languageCode || 'en', campaignName,
+      contacts, templateName, languageCode: languageCode || 'en_US', campaignName,
     }, {
       attempts: 2,
       backoff: { type: 'exponential', delay: 5000 },
